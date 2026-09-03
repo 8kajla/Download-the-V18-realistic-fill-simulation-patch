@@ -69,7 +69,12 @@ def startup_check():
     if missing: raise RuntimeError(f"DATA STORE INITIALIZATION FAILED: {missing}")
 
 def fill_callback(order,fill_price,fill_ts):
+    # Defensive computation: the simulator also sets this before callback, but
+    # the callback must never depend on a later mutation or format None.
+    fill_latency=max(0.0,float(fill_ts)-float(order.get("placed_ts",fill_ts)))
+    order["fill_latency_s"]=fill_latency
     meta=dict(order.get("meta") or {})
+    meta["fill_latency_s"]=fill_latency
     market=markets.get(order["condition"],{})
     market=market or {"condition":order["condition"],"id":meta.get("market_id",""),"slug":meta.get("slug",""),"asset":meta.get("asset",""),"market":meta.get("market",meta.get("asset","")),"start_ts":meta.get("start_ts",0),"end_ts":order["window_end_ts"],"up":meta.get("up_token",""),"down":meta.get("down_token","")}
     trade=ledger.buy(order["condition"],order["token"],order["market"],order["side"],fill_price,order["notional"],fill_ts,meta)
