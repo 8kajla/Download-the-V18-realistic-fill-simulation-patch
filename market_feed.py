@@ -85,7 +85,13 @@ class MarketTradeFeed:
             try:
                 token=str(event["asset_id"]); price=float(event["price"]); size=float(event["size"])
                 ts=float(event.get("timestamp",0))/1000.0 if event.get("timestamp") else time.time()
-                self.on_trade(token,price,size,ts,event)
+                try:
+                    self.on_trade(token,price,size,ts,event)
+                except Exception:
+                    # A fill/logging callback must never terminate the websocket
+                    # dispatcher. The feed remains alive and can process later
+                    # trade prints, while the exception is fully logged.
+                    log.exception("CLOB trade callback failed | token=%s price=%s size=%s", token, price, size)
             except (TypeError,ValueError,KeyError):
                 continue
 
