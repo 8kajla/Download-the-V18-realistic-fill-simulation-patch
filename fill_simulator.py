@@ -32,6 +32,9 @@ class FillSimulator:
         self.fill_callback = fill_callback
         self.lock = threading.RLock()
         self.orders: Dict[str, dict] = {}
+        self._progress_buffer = []
+        self._progress_flush_seconds = max(0.25, float(__import__("os").getenv("FILL_PROGRESS_FLUSH_SECONDS", "1")))
+        self._last_progress_flush = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -137,7 +140,7 @@ class FillSimulator:
                     float(order.get("cumulative_volume_through_price", 0.0))
                     + trade_size
                 )
-                self.research.record_fill_progress(order, trade_price, trade_size, trade_ts)
+                self._progress_buffer.append({"order": dict(order), "price": trade_price, "size": trade_size, "ts": trade_ts})
 
                 # With zero depth ahead the first qualifying print is enough.
                 # Otherwise wait until observed volume reaches the captured
@@ -209,6 +212,26 @@ class FillSimulator:
             self.research.record_fill(order, trade)
             self.save()
             return trade
+
+    def flush_progress(self, force=False, now=None) -> int:
+        now = time.time() if now is None else float(now)
+        with self.lock:
+            if not self._progress_buffer:
+                return 0
+            if not force and now - self._last_progress_flush < self._progress_flush_seconds:
+                return 0
+            rows = self._progress_buffer
+            self._progress_buffer = []
+            self._last_progress_flush = now
+        written = 0
+        for item in rows:
+            try:
+                self.research.record_fill_progress(item["order"], item["price"], item["size"], item["ts"])
+                written += 1
+            except Exception:
+                # Research logging must never block or break execution.
+                pass
+        return written
 
     def expire_due(self, now=None) -> list[dict]:
         now = time.time() if now is None else float(now)
