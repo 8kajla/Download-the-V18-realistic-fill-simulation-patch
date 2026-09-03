@@ -187,7 +187,7 @@ def test_v16_quota_prefers_underrepresented_available_band():
 
 
 def test_v161_bot_banner_and_strategy_version():
-    assert 'V18 REALISTIC CLOB TRADE-TAPE FILL SIMULATION' in Path(__file__).resolve().parents[1].joinpath('bot.py').read_text()
+    assert 'IMMEDIATE CLOB TAKER SIMULATION' in Path(__file__).resolve().parents[1].joinpath('bot.py').read_text()
 
 
 def test_v17_entry_count_decreases_all_regimes():
@@ -303,5 +303,7 @@ def test_v18_execution_speed_settings_are_subsecond_and_bounded():
     src = Path(__file__).parents[1].joinpath("bot.py").read_text()
     assert 'LOOP_SECONDS", "0.25"' in src
     assert 'DISCOVERY_INTERVAL_SECONDS' in src
-    assert 'FILL_SIMULATION' in src
-    assert 'MarketTradeFeed' in src
+    assert 'ImmediateClobExecutor' in src
+    assert 'MarketTradeFeed' not in src
+    assert 'FillSimulator' not in src
+
