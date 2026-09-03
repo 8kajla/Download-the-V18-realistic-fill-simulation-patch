@@ -34,7 +34,7 @@ strategy=CapitalFirstStrategy(
 ledger=PaperLedger(DATA/"paper_state.json",strategy.bankroll); ledger.save()
 strategy.restore_policy_state(ledger.trades)
 research=ResearchLogger(DATA,ledger)
-markets={}; histories={}; resolution_markets={}; last_trade={}; ob_last={}
+markets={}; histories={}; resolution_markets={}; signal_markets={}; last_trade={}; ob_last={}
 last_disc=last_report=0.0; next_trade_at=0.0; consecutive_errors=0
 BURST_GAP_SECONDS=float(os.getenv("BURST_GAP_SECONDS","18"))
 CADENCE_FALLBACK_SECONDS=max(0.5,float(os.getenv("CADENCE_FALLBACK_SECONDS","2")))
@@ -88,20 +88,31 @@ fill_sim=FillSimulator(DATA/os.getenv("FILL_STATE_FILE","pending_orders.json"),l
 feed=MarketTradeFeed(lambda token,price,size,ts,event: fill_sim.on_trade_print(token,price,size,ts)) if FILL_ENABLED else None
 
 def resolve_pending(now):
-    for condition,market in list(resolution_markets.items()):
-        if now<float(market.get("end_ts",0))+2: continue
+    # Resolve every market that had either a real filled position or an
+    # instant-fill shadow signal.  The latter is required for a true
+    # signal-vs-realistic-execution comparison even when the order never fills.
+    conditions = set(resolution_markets) | set(signal_markets)
+    for condition in list(conditions):
+        market = resolution_markets.get(condition) or signal_markets.get(condition) or markets.get(condition)
+        if not market or now < float(market.get("end_ts", 0)) + 2:
+            continue
         try:
-            token,outcome,status=resolve(market)
+            token, outcome, status = resolve(market)
             if token:
-                closed=ledger.settle(condition,token); pnl=sum(float(x["pnl"]) for x in closed)
-                research.record_resolution(ts=now,market=market,winner=outcome or token,winner_token=token,closed=closed)
-                research.record_instant_resolution(market,token,now)
-                log.info("RESOLUTION | %s | winner=%s | filled_pnl=%+.4f | closed=%d",market["slug"],outcome or token,pnl,len(closed))
-                resolution_markets.pop(condition,None); markets.pop(condition,None); histories.pop(condition,None)
-            elif status=="CLOSED_UNRESOLVED": research.record_resolution_error(ts=now,market=market,status=status)
+                closed = ledger.settle(condition, token) if condition in resolution_markets else []
+                pnl = sum(float(x["pnl"]) for x in closed)
+                research.record_resolution(ts=now, market=market, winner=outcome or token, winner_token=token, closed=closed)
+                research.record_instant_resolution(market, token, now)
+                log.info("RESOLUTION | %s | winner=%s | filled_pnl=%+.4f | closed=%d", market["slug"], outcome or token, pnl, len(closed))
+                resolution_markets.pop(condition, None)
+                signal_markets.pop(condition, None)
+                markets.pop(condition, None)
+                histories.pop(condition, None)
+            elif status == "CLOSED_UNRESOLVED":
+                research.record_resolution_error(ts=now, market=market, status=status)
         except Exception as exc:
-            research.record_resolution_error(ts=now,market=market,status=f"ERROR:{type(exc).__name__}")
-            log.warning("RESOLUTION ERROR | %s | %s",market.get("slug"),exc)
+            research.record_resolution_error(ts=now, market=market, status=f"ERROR:{type(exc).__name__}")
+            log.warning("RESOLUTION ERROR | %s | %s", market.get("slug"), exc)
 
 def report(books):
     global last_report
@@ -137,7 +148,7 @@ def main():
                     elapsed=now-m["start_ts"]; left=m["end_ts"]-now
                     if left<=0 or elapsed<0 or elapsed>300 or not m.get("accepting_orders"): continue
                     scannable.append((m,elapsed,left))
-                futures={BOOK_EXECUTOR.submit(book,t):(m,tname) for m in scannable for tname,t in (("up",m["up"]),("down",m["down"]))}
+                futures={BOOK_EXECUTOR.submit(book, token):(m,tname) for m,_,_ in scannable for tname,token in (("up",m["up"]),("down",m["down"]))}
                 mb={}
                 for f in as_completed(futures):
                     m,tname=futures[f]
@@ -173,7 +184,8 @@ def main():
                                 except Exception: depth_ahead=float(signal.get("depth") or 0.0)
                                 meta={"slug":m["slug"],"asset":m["asset"],"market":m["market"],"start_ts":m["start_ts"],"end_ts":m["end_ts"],"market_id":m["id"],"up_token":m["up"],"down_token":m["down"],"model_version":strategy.VERSION,"entry_count_before":st["count"],"burst_position":st["burst_position"],"seconds_since_first_entry":st["seconds_since_first"],"seconds_since_previous_trade":st["seconds_since_previous"],"regime":regime,"fine_band":band,"execution_mode":"V18_TRADE_TAPE_QUEUE_PROXY","target_capital":target,"bid_size":signal.get("depth") or 0.0,"up_bid":best.get("bid") if best.get("side")=="Up" else None,"down_bid":best.get("bid") if best.get("side")=="Down" else None,"up_ask":best.get("ask") if best.get("side")=="Up" else None,"down_ask":best.get("ask") if best.get("side")=="Down" else None,"up_depth":best.get("depth") if best.get("side")=="Up" else None,"down_depth":best.get("depth") if best.get("side")=="Down" else None,"trajectory_likelihood":signal["trajectory_likelihood"],"movement":signal.get("movement")}
                                 order=fill_sim.place(condition=m["condition"],token=token,market=m["market"],side=signal["side"],target_price=target,notional=notion,placed_ts=now,window_end_ts=float(m["end_ts"]),depth_ahead=depth_ahead,meta=meta) if FILL_ENABLED else None
-                                research.record_instant_signal(order or {"order_id":"instant-disabled","condition":m["condition"],"token":token,"market":m["market"],"side":signal["side"],"target_price":target,"notional":notion,"placed_ts":now,"meta":meta})
+                                signal_markets[m["condition"]] = m
+                                research.record_instant_signal(order or {"order_id":f"instant-{m['condition']}-{now:.6f}","condition":m["condition"],"token":token,"market":m["market"],"side":signal["side"],"target_price":target,"notional":notion,"placed_ts":now,"meta":meta})
                                 strategy.observe_trade_distribution(band,notion); next_trade_at=now+max(0.0,strategy.cadence.sample_gap())
                                 log.info("SIGNAL PENDING | %s | %s | target=%.4f notional=$%.2f depth_ahead=%.2f",m["asset"],signal["side"],target,notion,depth_ahead)
             report(books); time.sleep(LOOP_SECONDS); consecutive_errors=0
