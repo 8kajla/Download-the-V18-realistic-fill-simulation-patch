@@ -104,6 +104,14 @@ class FillSimulator:
                 if x.get("status") == "PENDING" and x.get("token") == str(token)
             ]
 
+    def _existing_trade_for_order(self, order_id):
+        for trade in reversed(getattr(self.ledger, "trades", [])):
+            if trade.get("action") != "BUY":
+                continue
+            if (trade.get("meta") or {}).get("shadow_order_id") == order_id or trade.get("shadow_order_id") == order_id:
+                return trade
+        return None
+
     def on_trade_print(self, token, trade_price, trade_size, trade_ts=None) -> list[dict]:
         trade_ts = time.time() if trade_ts is None else float(trade_ts)
         try:
@@ -153,20 +161,33 @@ class FillSimulator:
                 return {}
             fill_price = float(fill_price)
             fill_ts = float(fill_ts)
+            if not 0.0 < fill_price < 1.0:
+                raise ValueError("invalid observed fill price")
+
+            # Crash-safe/idempotent recovery: if the ledger was committed but
+            # the simulator process died before persisting FILLED, never buy a
+            # second time on restart/reconnect.
+            existing = self._existing_trade_for_order(order["order_id"])
+            if existing is not None:
+                trade = existing
+            else:
+                meta = dict(order.get("meta") or {})
+                meta.update({
+                    "shadow_order_id": order["order_id"],
+                    "fill_latency_s": max(0.0, fill_ts - float(order["placed_ts"])),
+                    "target_price": order["target_price"],
+                    "depth_ahead": order["depth_ahead"],
+                    "cumulative_volume_through_price": order["cumulative_volume_through_price"],
+                    "fill_simulation": "TRADE_TAPE_QUEUE_PROXY",
+                })
+                # Do not mark the shadow order FILLED until the ledger buy has
+                # succeeded. This keeps the simulator retryable after errors.
+                trade = self.fill_callback(order, fill_price, fill_ts)
+
             order["status"] = "FILLED"
-            order["fill_price"] = fill_price
-            order["fill_ts"] = fill_ts
-            order["fill_latency_s"] = max(0.0, fill_ts - float(order["placed_ts"]))
-            meta = dict(order.get("meta") or {})
-            meta.update({
-                "shadow_order_id": order["order_id"],
-                "fill_latency_s": order["fill_latency_s"],
-                "target_price": order["target_price"],
-                "depth_ahead": order["depth_ahead"],
-                "cumulative_volume_through_price": order["cumulative_volume_through_price"],
-                "fill_simulation": "TRADE_TAPE_QUEUE_PROXY",
-            })
-            trade = self.fill_callback(order, fill_price, fill_ts)
+            order["fill_price"] = float(trade.get("price", fill_price)) if isinstance(trade, dict) else fill_price
+            order["fill_ts"] = float(trade.get("ts", fill_ts)) if isinstance(trade, dict) else fill_ts
+            order["fill_latency_s"] = max(0.0, order["fill_ts"] - float(order["placed_ts"]))
             self.research.record_fill(order, trade)
             self.save()
             return trade
