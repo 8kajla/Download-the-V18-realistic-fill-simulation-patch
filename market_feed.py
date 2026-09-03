@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json, logging, threading, time
+from queue import Queue, Full, Empty
 from typing import Callable, Iterable
 import websocket
 
@@ -17,8 +18,11 @@ class MarketTradeFeed:
         self.on_trade=on_trade; self.ping_seconds=ping_seconds
         self._tokens=set(); self._lock=threading.RLock(); self._stop=threading.Event()
         self._ws=None; self._thread=threading.Thread(target=self._run,daemon=True,name="clob-trade-feed")
+        self._worker=threading.Thread(target=self._dispatch_loop,daemon=True,name="clob-trade-dispatch")
+        self._queue=Queue(maxsize=max(1000, int(__import__("os").getenv("TRADE_FEED_QUEUE_MAX","50000"))))
 
     def start(self):
+        if not self._worker.is_alive(): self._worker.start()
         if not self._thread.is_alive(): self._thread.start()
 
     def stop(self):
@@ -85,15 +89,42 @@ class MarketTradeFeed:
             try:
                 token=str(event["asset_id"]); price=float(event["price"]); size=float(event["size"])
                 ts=float(event.get("timestamp",0))/1000.0 if event.get("timestamp") else time.time()
+                # Unit-test/direct-use compatibility: before start(), there is
+                # no dispatcher thread, so deliver synchronously. In production
+                # start() is called first and all socket callbacks are queued.
+                if not self._worker.is_alive():
+                    try:
+                        self.on_trade(token, price, size, ts, event)
+                    except Exception:
+                        log.exception("CLOB trade callback failed | token=%s price=%s size=%s", token, price, size)
+                    continue
                 try:
-                    self.on_trade(token,price,size,ts,event)
-                except Exception:
-                    # A fill/logging callback must never terminate the websocket
-                    # dispatcher. The feed remains alive and can process later
-                    # trade prints, while the exception is fully logged.
-                    log.exception("CLOB trade callback failed | token=%s price=%s size=%s", token, price, size)
+                    self._queue.put_nowait((token, price, size, ts, event))
+                except Full:
+                    # Never block the websocket reader on the application
+                    # callback. A full queue means the consumer is unhealthy;
+                    # reconnecting is preferable to letting the server close
+                    # the socket with 1013/slow-consumer.
+                    log.error("CLOB trade dispatch queue full | size=%d", self._queue.qsize())
+                    try: ws.close()
+                    except Exception: pass
+                    return
             except (TypeError,ValueError,KeyError):
                 continue
+
+
+    def _dispatch_loop(self):
+        while not self._stop.is_set():
+            try:
+                token, price, size, ts, event = self._queue.get(timeout=0.5)
+            except Empty:
+                continue
+            try:
+                self.on_trade(token, price, size, ts, event)
+            except Exception:
+                log.exception("CLOB trade callback failed | token=%s price=%s size=%s", token, price, size)
+            finally:
+                self._queue.task_done()
 
     def _on_error(self,ws,error): log.warning("CLOB trade feed error: %s",error)
     def _on_close(self,ws,code,msg): log.warning("CLOB trade feed closed | code=%s msg=%s",code,msg)
