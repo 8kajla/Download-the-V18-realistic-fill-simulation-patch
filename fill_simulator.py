@@ -167,6 +167,15 @@ class FillSimulator:
             # Crash-safe/idempotent recovery: if the ledger was committed but
             # the simulator process died before persisting FILLED, never buy a
             # second time on restart/reconnect.
+            # Compute and persist latency BEFORE invoking the callback. The
+            # callback runs synchronously and is allowed to log/read the order;
+            # the old implementation populated this field only after callback
+            # return, which caused Railway fills to crash with None formatting.
+            fill_latency = max(0.0, fill_ts - float(order["placed_ts"]))
+            order["fill_price"] = fill_price
+            order["fill_ts"] = fill_ts
+            order["fill_latency_s"] = fill_latency
+
             existing = self._existing_trade_for_order(order["order_id"])
             if existing is not None:
                 trade = existing
@@ -174,15 +183,24 @@ class FillSimulator:
                 meta = dict(order.get("meta") or {})
                 meta.update({
                     "shadow_order_id": order["order_id"],
-                    "fill_latency_s": max(0.0, fill_ts - float(order["placed_ts"])),
+                    "fill_latency_s": fill_latency,
                     "target_price": order["target_price"],
                     "depth_ahead": order["depth_ahead"],
                     "cumulative_volume_through_price": order["cumulative_volume_through_price"],
                     "fill_simulation": "TRADE_TAPE_QUEUE_PROXY",
                 })
-                # Do not mark the shadow order FILLED until the ledger buy has
-                # succeeded. This keeps the simulator retryable after errors.
-                trade = self.fill_callback(order, fill_price, fill_ts)
+                # Keep the order PENDING until the ledger buy/callback succeeds.
+                # If the callback raises after committing the ledger, the next
+                # tape print is idempotently recovered by _existing_trade_for_order.
+                original_meta = order.get("meta")
+                order["meta"] = meta
+                try:
+                    trade = self.fill_callback(order, fill_price, fill_ts)
+                except Exception:
+                    # Restore the signal metadata while retaining the observed
+                    # fill attempt fields for diagnostics/retry.
+                    order["meta"] = original_meta if original_meta is not None else {}
+                    raise
 
             order["status"] = "FILLED"
             order["fill_price"] = float(trade.get("price", fill_price)) if isinstance(trade, dict) else fill_price
