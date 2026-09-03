@@ -93,7 +93,7 @@ class ImmediateClobExecutor:
         self._signals += 1
         if requested <= 0:
             self._unfilled += 1
-            return self._empty("invalid_notional", signal_bid)
+            return self._empty("invalid_notional", signal_bid, requested_notional=requested, strategy_band=strategy_band)
         if strategy is None:
             raise ValueError("strategy is required for fine-band bounds")
 
@@ -104,7 +104,7 @@ class ImmediateClobExecutor:
             self._book_errors += 1
             self._unfilled += 1
             LOG.warning("CLOB BOOK ERROR | token=%s | %s", token, exc)
-            return self._empty("book_error", signal_bid, error=str(exc))
+            return self._empty("book_error", signal_bid, requested_notional=requested, strategy_band=strategy_band, error=str(exc))
 
         # Strict band preservation: only asks inside the signal's fine band
         # count. This means execution cannot silently turn a Cheap signal into
@@ -112,7 +112,7 @@ class ImmediateClobExecutor:
         eligible = [(p, s) for p, s in snap["asks"] if lo <= p < hi]
         if not eligible:
             self._unfilled += 1
-            return self._empty("no_in_band_ask", signal_bid, snapshot=snap)
+            return self._empty("no_in_band_ask", signal_bid, snapshot=snap, requested_notional=requested, strategy_band=strategy_band)
 
         remaining = requested
         fills = []
@@ -133,6 +133,8 @@ class ImmediateClobExecutor:
                 "insufficient_in_band_liquidity",
                 signal_bid,
                 snapshot=snap,
+                requested_notional=requested,
+                strategy_band=strategy_band,
                 available_notional=requested - remaining,
             )
 
@@ -158,16 +160,17 @@ class ImmediateClobExecutor:
         }
 
     @staticmethod
-    def _empty(reason, signal_bid, snapshot=None, **extra):
+    def _empty(reason, signal_bid, snapshot=None, requested_notional=0.0,
+               strategy_band=None, **extra):
         out = {
             "filled": False,
             "reason": reason,
-            "requested_notional": 0.0,
+            "requested_notional": float(requested_notional),
             "executed_notional": 0.0,
             "shares": 0.0,
             "vwap": None,
             "signal_bid": signal_bid,
-            "strategy_band": None,
+            "strategy_band": strategy_band,
             "slippage": None,
         }
         if snapshot is not None:
