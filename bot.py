@@ -92,6 +92,47 @@ def fill_callback(order,fill_price,fill_ts):
 fill_sim=FillSimulator(DATA/os.getenv("FILL_STATE_FILE","pending_orders.json"),ledger,research,fill_callback)
 feed=MarketTradeFeed(lambda token,price,size,ts,event: fill_sim.on_trade_print(token,price,size,ts)) if FILL_ENABLED else None
 
+def recover_position_markets():
+    """Rebuild resolution metadata for positions surviving a restart.
+
+    Discovery only returns currently active markets. A persistent paper
+    position can belong to an already-expired market, so relying on discovery
+    alone can strand capital forever. Every BUY stores the market metadata in
+    the position; reconstruct enough of that metadata here so resolve() can
+    settle it after a restart.
+    """
+    recovered = 0
+    for position in list(ledger.positions.values()):
+        condition = position.get("condition")
+        if not condition or condition in resolution_markets:
+            continue
+        end_ts = position.get("end_ts")
+        if end_ts is None:
+            continue
+        try:
+            end_ts = float(end_ts)
+        except (TypeError, ValueError):
+            continue
+        market = {
+            "condition": str(condition),
+            "id": str(position.get("market_id") or position.get("id") or ""),
+            "slug": str(position.get("slug") or ""),
+            "asset": str(position.get("asset") or ""),
+            "market": str(position.get("market") or position.get("asset") or ""),
+            "start_ts": float(position.get("start_ts") or max(0.0, end_ts - 300.0)),
+            "end_ts": end_ts,
+            "up": str(position.get("up_token") or ""),
+            "down": str(position.get("down_token") or ""),
+        }
+        if market["id"] or market["slug"]:
+            resolution_markets[str(condition)] = market
+            recovered += 1
+    if recovered:
+        log.info("STATE RECOVERY | resolution_markets=%d recovered_positions=%d",
+                 len(resolution_markets), recovered)
+
+recover_position_markets()
+
 def resolve_pending(now):
     # Resolve every market that had either a real filled position or an
     # instant-fill shadow signal.  The latter is required for a true
@@ -143,7 +184,9 @@ def main():
                 if feed: feed.set_tokens(tokens)
                 last_disc=now
                 log.info("MARKETS | active=%d resolution=%d pending_orders=%d",len(markets),len(resolution_markets),fill_sim.active_count())
-            if FILL_ENABLED and FILL_EXPIRY_ENABLED: fill_sim.expire_due(now)
+            if FILL_ENABLED:
+                fill_sim.flush_progress(now=now)
+                if FILL_EXPIRY_ENABLED: fill_sim.expire_due(now)
             resolve_pending(now)
             books={}; market_list=list(markets.values())
             if now>=next_trade_at:
@@ -193,7 +236,7 @@ def main():
                                 research.record_instant_signal(order or {"order_id":f"instant-{m['condition']}-{now:.6f}","condition":m["condition"],"token":token,"market":m["market"],"side":signal["side"],"target_price":target,"notional":notion,"placed_ts":now,"meta":meta})
                                 strategy.observe_trade_distribution(band,notion); next_trade_at=now+max(0.0,strategy.cadence.sample_gap())
                                 log.info("SIGNAL PENDING | %s | %s | target=%.4f notional=$%.2f depth_ahead=%.2f",m["asset"],signal["side"],target,notion,depth_ahead)
-            report(books); time.sleep(LOOP_SECONDS); consecutive_errors=0
+            report(books); fill_sim.flush_progress(force=True, now=time.time()); time.sleep(LOOP_SECONDS); consecutive_errors=0
         except KeyboardInterrupt:
             if feed: feed.stop()
             raise
